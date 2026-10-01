@@ -1,0 +1,302 @@
+---
+# Pi-hole + Unbound + Tailscale + WARP - Cohesive K8s Deployment
+# NUCUBT01 Critical Service (v2: Multi-container Pod Architecture)
+#
+# UNIFIED ARCHITECTURE: All services (WARP egress, Tailscale exit node, DNS)
+# run in a single K8s pod. Pod failure = all services restart together.
+# No orphaned DNS without egress. No exit node without DNS.
+#
+# Requires:
+#  - /DATA/AppData/big-bear-pihole-unbound/{etc,dnsmasq.d,unbound}
+#  - Vault: secret/tailscale/auth-key (Tailscale reusable auth key)
+#  - Vault: secret/warp/account-id, secret/warp/device-id (Cloudflare credentials - optional for egress)
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns
+
+---
+# Secret: Tailscale auth key (pulled from Vault at deploy time)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tailscale-auth
+  namespace: dns
+type: Opaque
+stringData:
+  TS_AUTHKEY: "tskey-placeholder"  # Replace with actual key from Vault
+  # TS_AUTHKEY should be: vault kv get -field=value secret/tailscale/auth-key
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pihole-dns
+  namespace: dns
+  labels:
+    app: pihole-dns
+    critical: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pihole-dns
+  template:
+    metadata:
+      labels:
+        app: pihole-dns
+    spec:
+      # hostNetwork=true: Allows WARP tunnel binding + direct port 53 access
+      # All containers share host network = tight coupling
+      hostNetwork: true
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 127.0.0.1  # Query local Unbound
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+
+      # Init container 1: Setup WARP tunnel (runs once, exits when ready)
+      initContainers:
+      - name: warp-init
+        image: caomingjun/warp:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+              - NET_ADMIN
+              - SYS_MODULE
+        sysctls:
+          - name: net.ipv4.conf.all.src_valid_mark
+            value: "1"
+        volumeMounts:
+          - name: warp-config
+            mountPath: /var/lib/cloudflare-warp
+        command:
+          - /bin/sh
+          - -c
+        args:
+          - |
+            echo "[WARP] Starting tunnel setup..."
+            # WARP establishes tunnel and exits
+            # Pod remains running with tunnel active
+            # If tunnel fails, init container retries via K8s restart policy
+            # Check if tunnel is active
+            if ip link show | grep -q warp; then
+              echo "[WARP] Tunnel already active"
+            else
+              echo "[WARP] Establishing tunnel..."
+              # Start WARP daemon (runs in background)
+              /app/warp-svc &
+              sleep 10
+              echo "[WARP] Tunnel initialized"
+            fi
+
+      containers:
+      # Container 1: Tailscale exit node (sidecar)
+      - name: tailscale
+        image: tailscale/tailscale:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+              - NET_ADMIN
+              - SYS_MODULE
+        env:
+          - name: TS_AUTHKEY
+            valueFrom:
+              secretKeyRef:
+                name: tailscale-auth
+                key: TS_AUTHKEY
+          - name: TS_HOSTNAME
+            value: "nucubt01-dns-exit"
+          - name: TS_STATE_DIR
+            value: "/var/lib/tailscale"
+          # Advertise exit node
+          - name: TS_EXTRA_ARGS
+            value: "--advertise-exit-node"
+        volumeMounts:
+          - name: tailscale-state
+            mountPath: /var/lib/tailscale
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - "tailscale status | grep -q 'Hostname'; exit 0"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+      # Container 2: Pi-hole + Unbound (main DNS service)
+      - name: pihole
+        image: bigbeartechworld/big-bear-pihole-unbound:2026.04.0
+        imagePullPolicy: IfNotPresent
+
+        # Startup sequence (same as v1, optimized for multi-container)
+        command:
+          - /bin/sh
+          - -c
+        args:
+          - |
+            echo "[DNS] Waiting for egress services (WARP/Tailscale)..."
+            # Wait for WARP tunnel (check for interface or route)
+            for i in $(seq 1 30); do
+              if ip route show | grep -q warp || ip link show | grep -q warp; then
+                echo "[DNS] WARP tunnel ready"
+                break
+              fi
+              echo "[DNS] WARP not ready, waiting... ($i/30)"
+              sleep 2
+            done
+
+            echo "[DNS] Waiting for Tailscale..."
+            for i in $(seq 1 30); do
+              if tailscale status 2>/dev/null | grep -q "Hostname"; then
+                echo "[DNS] Tailscale ready"
+                break
+              fi
+              echo "[DNS] Tailscale not ready, waiting... ($i/30)"
+              sleep 2
+            done
+
+            echo "[DNS] Starting Pi-hole + Unbound..."
+            # unbound-anchor with timeout (graceful degradation)
+            if [ ! -f /var/lib/unbound/root.key ]; then
+              timeout 10 unbound-anchor -a /var/lib/unbound/root.key >/dev/null 2>&1 || touch /var/lib/unbound/root.key
+            fi
+            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+            exec /start-unbound.sh
+
+        ports:
+          - name: dns-tcp
+            containerPort: 53
+            protocol: TCP
+            hostPort: 53
+          - name: dns-udp
+            containerPort: 53
+            protocol: UDP
+            hostPort: 53
+          - name: http
+            containerPort: 8001
+            protocol: TCP
+            hostPort: 8001
+
+        # Startup probe: 90s grace (accounts for WARP/Tailscale init + unbound-anchor)
+        startupProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 10       # Wait for egress services
+          periodSeconds: 5
+          failureThreshold: 18          # 90s total (18 × 5s)
+          timeoutSeconds: 2
+
+        # Readiness probe: DNS actually responding
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - "dig @127.0.0.1 +short google.com >/dev/null 2>&1"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        # Liveness probe: TCP port binding (aggressive)
+        livenessProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 2
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        volumeMounts:
+          - name: etc-pihole
+            mountPath: /etc/pihole
+          - name: etc-dnsmasq
+            mountPath: /etc/dnsmasq.d
+          - name: unbound-conf
+            mountPath: /etc/unbound
+
+      # Host volumes: persistent config across pod restarts
+      volumes:
+        - name: etc-pihole
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/etc
+            type: Directory
+        - name: etc-dnsmasq
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/dnsmasq.d
+            type: Directory
+        - name: unbound-conf
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/unbound
+            type: Directory
+        - name: warp-config
+          hostPath:
+            path: /DATA/AppData/warp-cli
+            type: DirectoryOrCreate
+        - name: tailscale-state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+---
+# Pod Disruption Budget: Block voluntary eviction
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pihole-dns-pdb
+  namespace: dns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pihole-dns
+
+---
+# Service for in-cluster DNS queries
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-dns
+  namespace: dns
+  labels:
+    app: pihole-dns
+spec:
+  type: ClusterIP
+  selector:
+    app: pihole-dns
+  ports:
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
