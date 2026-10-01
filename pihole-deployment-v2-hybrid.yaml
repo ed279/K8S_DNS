@@ -1,0 +1,277 @@
+---
+# Pi-hole + Unbound + Tailscale - K8s Deployment (v2 Hybrid)
+# NUCUBT01 Critical Service
+#
+# HYBRID ARCHITECTURE: Tailscale sidecar + Pi-hole main container
+# in one K8s pod with unified self-healing.
+# WARP tunnel runs on host (systemd service) — inherits via hostNetwork=true.
+#
+# Startup:
+#   1. Tailscale sidecar joins tailnet (auth key from Vault/Secret)
+#   2. Pi-hole waits for Tailscale to be ready
+#   3. Both share host network + WARP tunnel
+#   4. Single failure domain: pod death = both services restart
+#
+# Requires:
+#  - /DATA/AppData/big-bear-pihole-unbound/{etc,dnsmasq.d,unbound}
+#  - Vault: secret/tailscale/auth-key (Tailscale reusable auth key)
+#  - Host WARP running (systemd service or bare metal)
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns
+
+---
+# Secret: Tailscale auth key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tailscale-auth
+  namespace: dns
+type: Opaque
+stringData:
+  TS_AUTHKEY: "tskey-placeholder"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pihole
+  namespace: dns
+  labels:
+    app: pihole
+    version: "2-hybrid"
+    critical: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pihole
+  template:
+    metadata:
+      labels:
+        app: pihole
+        version: "2-hybrid"
+    spec:
+      # hostNetwork=true: Allows direct port 53 binding + WARP tunnel access
+      # Both containers share host network namespace
+      hostNetwork: true
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 127.0.0.1
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      # Container 1: Tailscale exit node (sidecar)
+      # Runs continuously, joined to tailnet before Pi-hole starts
+      - name: tailscale
+        image: tailscale/tailscale:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+              - NET_ADMIN
+              - NET_RAW
+              - SYS_MODULE
+        env:
+          # Auth key from Secret (pulls from Vault at deploy time)
+          - name: TS_AUTHKEY
+            valueFrom:
+              secretKeyRef:
+                name: tailscale-auth
+                key: TS_AUTHKEY
+          # Advertise exit node globally
+          - name: TS_EXTRA_ARGS
+            value: "--advertise-exit-node"
+          # Pod hostname in tailnet
+          - name: TS_HOSTNAME
+            value: "nucubt01-dns-tailscale"
+          # Persist state across pod restarts
+          - name: TS_STATE_DIR
+            value: "/var/lib/tailscale"
+        volumeMounts:
+          - name: tailscale-state
+            mountPath: /var/lib/tailscale
+        # Liveness probe: Tailscale must be connected
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - "tailscale status | grep -q Hostname"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 3
+          timeoutSeconds: 5
+        # Resource limits
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+      # Container 2: Pi-hole + Unbound (main DNS service)
+      - name: pihole
+        image: bigbeartechworld/big-bear-pihole-unbound:2026.04.0
+        imagePullPolicy: IfNotPresent
+
+        # Startup: Wait for Tailscale before starting DNS
+        command:
+          - /bin/sh
+          - -c
+        args:
+          - |
+            echo "[DNS] Waiting for Tailscale sidecar to be ready..."
+            for i in $(seq 1 40); do
+              if tailscale status 2>/dev/null | grep -q "Hostname"; then
+                echo "[DNS] Tailscale ready (hostname registered)"
+                break
+              fi
+              if [ $i -eq 40 ]; then
+                echo "[DNS] WARNING: Tailscale not ready after 80s, starting DNS anyway"
+              else
+                echo "[DNS] Waiting for Tailscale... ($i/40, $(($i * 2))s)"
+              fi
+              sleep 2
+            done
+
+            echo "[DNS] Checking WARP tunnel (host)..."
+            if ip route show | grep -q "default via" && ! ip link show | grep -q "tun0"; then
+              echo "[DNS] WARP tunnel available (inherited via hostNetwork)"
+            else
+              echo "[DNS] WARNING: WARP tunnel may not be active on host"
+            fi
+
+            echo "[DNS] Starting Pi-hole + Unbound..."
+            # unbound-anchor: timeout 10s, graceful fallback
+            if [ ! -f /var/lib/unbound/root.key ]; then
+              timeout 10 unbound-anchor -a /var/lib/unbound/root.key >/dev/null 2>&1 || touch /var/lib/unbound/root.key
+            fi
+            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+            exec /start-unbound.sh
+
+        ports:
+          - name: dns-tcp
+            containerPort: 53
+            protocol: TCP
+            hostPort: 53
+          - name: dns-udp
+            containerPort: 53
+            protocol: UDP
+            hostPort: 53
+          - name: http
+            containerPort: 8001
+            protocol: TCP
+            hostPort: 8001
+
+        # Startup probe: Account for Tailscale wait + Pi-hole init
+        startupProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 20       # 100s total (20 × 5s)
+          timeoutSeconds: 2
+
+        # Readiness probe: DNS must actually respond
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - "dig @127.0.0.1 +short google.com >/dev/null 2>&1"
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        # Liveness probe: TCP port binding (aggressive)
+        livenessProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 2
+
+        # Resource limits
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        volumeMounts:
+          - name: etc-pihole
+            mountPath: /etc/pihole
+          - name: etc-dnsmasq
+            mountPath: /etc/dnsmasq.d
+          - name: unbound-conf
+            mountPath: /etc/unbound
+
+      # Persistent volumes
+      volumes:
+        - name: etc-pihole
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/etc
+            type: Directory
+        - name: etc-dnsmasq
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/dnsmasq.d
+            type: Directory
+        - name: unbound-conf
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/unbound
+            type: Directory
+        # Tailscale state: ephemeral (re-auth per pod restart)
+        - name: tailscale-state
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+---
+# Pod Disruption Budget: Critical service protection
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pihole-pdb
+  namespace: dns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pihole
+
+---
+# Service for in-cluster DNS queries
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-dns
+  namespace: dns
+  labels:
+    app: pihole
+spec:
+  type: ClusterIP
+  selector:
+    app: pihole
+  ports:
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: dns-tcp
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: dns-udp
