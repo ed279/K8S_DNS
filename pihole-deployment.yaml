@@ -80,14 +80,49 @@ spec:
             containerPort: 8001
             protocol: TCP
 
-        # Liveness probe: TCP connection to port 53
+        # Startup probe: accounts for unbound-anchor timeout (10s) + initial startup
+        # If pod doesn't become healthy within this window, K8s considers it failed
+        startupProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 5       # Wait 5s before first check
+          periodSeconds: 5             # Check every 5s during startup
+          failureThreshold: 15         # Allow up to 75s (15 × 5s) for full startup
+          timeoutSeconds: 2
+
+        # Readiness probe: DNS must actually respond to queries
+        # Separate from liveness — pod may bind port 53 but not serve DNS yet
+        readinessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - "dig @127.0.0.1 +short google.com >/dev/null 2>&1"
+          initialDelaySeconds: 30      # Wait 30s before checking
+          periodSeconds: 10            # Check every 10s
+          failureThreshold: 3          # Mark unready after 3 failures
+          timeoutSeconds: 5            # Allow 5s for dig to complete
+          successThreshold: 1          # Need 1 success to be ready
+
+        # Liveness probe: TCP connection to port 53 (aggressive)
+        # Catches pod hangs or port binding issues
         livenessProbe:
           tcpSocket:
             port: dns-tcp
-          initialDelaySeconds: 60      # Wait for startup
-          periodSeconds: 30            # Check every 30s
-          failureThreshold: 5          # Kill after 5 failures (150s)
-          timeoutSeconds: 1
+          initialDelaySeconds: 60      # Wait for full startup
+          periodSeconds: 10            # Check every 10s (tighter than before)
+          failureThreshold: 3          # Kill after 3 failures (30s total)
+          timeoutSeconds: 2
+
+        # Resource limits: prevent memory/CPU exhaustion
+        # Unbound + Pi-hole typically use 100-200MB
+        resources:
+          requests:
+            cpu: 100m                  # Minimum 0.1 core
+            memory: 256Mi              # Minimum 256MB
+          limits:
+            cpu: 500m                  # Maximum 0.5 core
+            memory: 512Mi              # Maximum 512MB
 
         # Volumes: bind host paths for persistent config
         volumeMounts:
@@ -112,6 +147,21 @@ spec:
           hostPath:
             path: /DATA/AppData/big-bear-pihole-unbound/unbound
             type: Directory
+
+---
+# Pod Disruption Budget: Protects critical DNS from voluntary evictions
+# Even on single-node K8s, this documents the criticality
+# On multi-node setup, this prevents cluster operations from taking down DNS
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pihole-pdb
+  namespace: dns
+spec:
+  minAvailable: 1  # CRITICAL: Must always have at least 1 pod running
+  selector:
+    matchLabels:
+      app: pihole
 
 ---
 # Optional: Service for in-cluster DNS queries
