@@ -1,0 +1,11 @@
+# License
+
+This Pi-hole DNS deployment configuration is provided as-is for NUCUBT01 homelab.
+
+Components:
+- K8s manifests: MIT License
+- Pi-hole: GPL v3 (see https://github.com/pi-hole/pi-hole)
+- Unbound: BSD License (see https://github.com/NLnetLabs/unbound)
+- dnsmasq: GPL v2 (see http://www.thekelleys.org.uk/dnsmasq/doc.html)
+
+When deploying, ensure compliance with respective licenses.

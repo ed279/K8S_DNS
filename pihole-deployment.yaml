@@ -1,0 +1,138 @@
+---
+# Pi-hole + Unbound DNS Service - Kubernetes Deployment
+# NUCUBT01 Critical Service
+#
+# This deployment provides recursive DNS (Unbound) + Pi-hole blocking
+# to all networks: LAN (10.0.9.0/24), Wireless (10.0.253.0/27),
+# Tailscale (100.71.x.x), and K8s pods.
+#
+# Requires: /DATA/AppData/big-bear-pihole-unbound/{etc,dnsmasq.d,unbound}
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pihole
+  namespace: dns
+  labels:
+    app: pihole
+    critical: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pihole
+  template:
+    metadata:
+      labels:
+        app: pihole
+    spec:
+      # hostNetwork=true: Pod uses host's network stack for port 53 binding
+      # and WARP egress inheritance (if available on host)
+      hostNetwork: true
+
+      # dnsPolicy=None + dnsConfig: Explicit resolver to avoid recursion
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 127.0.0.1  # Pod queries Unbound on localhost
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      - name: pihole
+        image: bigbeartechworld/big-bear-pihole-unbound:2026.04.0
+        imagePullPolicy: IfNotPresent
+
+        # Startup sequence:
+        # 1. Attempt to fetch DNSSEC root key (unbound-anchor)
+        #    - Wrapped in timeout: if no network/WARP, skip gracefully
+        # 2. Set permissions on root.key
+        # 3. Execute /start-unbound.sh (Unbound + Pi-hole startup)
+        command:
+          - /bin/sh
+          - -c
+        args:
+          - |
+            if [ ! -f /var/lib/unbound/root.key ]; then
+              timeout 10 unbound-anchor -a /var/lib/unbound/root.key >/dev/null 2>&1 || touch /var/lib/unbound/root.key
+            fi
+            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+            exec /start-unbound.sh
+
+        ports:
+          - name: dns-tcp
+            containerPort: 53
+            protocol: TCP
+          - name: dns-udp
+            containerPort: 53
+            protocol: UDP
+          # Pi-hole web UI (internal only)
+          - name: http
+            containerPort: 8001
+            protocol: TCP
+
+        # Liveness probe: TCP connection to port 53
+        livenessProbe:
+          tcpSocket:
+            port: dns-tcp
+          initialDelaySeconds: 60      # Wait for startup
+          periodSeconds: 30            # Check every 30s
+          failureThreshold: 5          # Kill after 5 failures (150s)
+          timeoutSeconds: 1
+
+        # Volumes: bind host paths for persistent config
+        volumeMounts:
+          - name: etc-pihole
+            mountPath: /etc/pihole
+          - name: etc-dnsmasq
+            mountPath: /etc/dnsmasq.d
+          - name: unbound-conf
+            mountPath: /etc/unbound
+
+      # Host volumes: persist across pod restarts
+      volumes:
+        - name: etc-pihole
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/etc
+            type: Directory
+        - name: etc-dnsmasq
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/dnsmasq.d
+            type: Directory
+        - name: unbound-conf
+          hostPath:
+            path: /DATA/AppData/big-bear-pihole-unbound/unbound
+            type: Directory
+
+---
+# Optional: Service for in-cluster DNS queries
+# (Not required if using hostNetwork=true and direct IP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: pihole-dns
+  namespace: dns
+  labels:
+    app: pihole
+spec:
+  type: ClusterIP
+  selector:
+    app: pihole
+  ports:
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: 53

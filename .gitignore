@@ -1,0 +1,13 @@
+# Runtime files
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Kubernetes backups
+*.yaml.bak
+*.json.bak
+
+# Local configs (don't commit sensitive data)
+/local/
+/secrets/
