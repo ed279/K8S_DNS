@@ -60,6 +60,12 @@ spec:
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 
+      # Pod-level sysctls (applied before containers start)
+      securityContext:
+        sysctls:
+          - name: net.ipv4.conf.all.src_valid_mark
+            value: "1"
+
       # Init container 1: Setup WARP tunnel (runs once, exits when ready)
       initContainers:
       - name: warp-init
@@ -71,9 +77,6 @@ spec:
             add:
               - NET_ADMIN
               - SYS_MODULE
-        sysctls:
-          - name: net.ipv4.conf.all.src_valid_mark
-            value: "1"
         volumeMounts:
           - name: warp-config
             mountPath: /var/lib/cloudflare-warp
