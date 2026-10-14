@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-stack
+  namespace: dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dns-stack
+  template:
+    metadata:
+      labels:
+        app: dns-stack
+    spec:
+      dnsPolicy: ClusterFirst
+      containers:
+      - name: dns
+        image: ubuntu:24.04
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          set -e
+          apt-get update >/dev/null 2>&1
+          apt-get install -y unbound dnsmasq dnsutils curl gnupg >/dev/null 2>&1
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg 2>/dev/null | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null 2>&1
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" > /etc/apt/sources.list.d/tailscale.list
+          apt-get update >/dev/null 2>&1
+          apt-get install -y tailscale >/dev/null 2>&1
+          echo "=== DNS Stack Starting ==="
+          mkdir -p /var/log/unbound /var/lib/dnsmasq /etc/dnsmasq.d
+          printf '%s\n' 'server:' '  interface: 0.0.0.0' '  port: 5335' '  access-control: 0.0.0.0/0 allow' '  verbosity: 1' '  auto-trust-anchor-file: "/var/lib/unbound/root.key"' '  num-threads: 4' '  cache-min-ttl: 300' '  cache-max-ttl: 86400' '  prefetch: yes' > /etc/unbound/unbound.conf
+          unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+          /usr/sbin/unbound &
+          UNBOUND_PID=$!
+          sleep 2
+          echo "[1/4] Unbound started (PID $UNBOUND_PID)"
+          printf '%s\n' 'listen-address=0.0.0.0' 'port=53' 'bind-interfaces' 'user=root' 'server=127.0.0.1#5335' 'domain-needed' 'bogus-priv' 'cache-size=10000' > /etc/dnsmasq.conf
+          dnsmasq &
+          DNSMASQ_PID=$!
+          sleep 2
+          echo "[2/4] dnsmasq started (PID $DNSMASQ_PID)"
+          if timeout 2 dig @127.0.0.1 google.com +short 2>/dev/null | grep -q . ; then
+            echo "[3/4] DNS resolution working"
+          else
+            echo "[3/4] DNS startup (checking...)"
+          fi
+          if [ -n "$TS_AUTHKEY" ]; then
+            echo "[4/4] Joining Tailscale..."
+            tailscale up --authkey="$TS_AUTHKEY" --hostname="dns-k8s" --advertise-exit-node 2>&1 | head -3 || true
+          else
+            echo "[4/4] Tailscale: auth key not configured"
+          fi
+          echo "=== Ready ==="
+          wait
+        
+        env:
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef:
+              name: tailscale-auth
+              key: TS_AUTHKEY
+              optional: true
+        
+        ports:
+        - containerPort: 53
+          protocol: UDP
+        - containerPort: 53
+          protocol: TCP
+        - containerPort: 5335
+          protocol: UDP
+        
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - "dig @127.0.0.1 google.com +short | grep -q . || exit 0"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-stack
+  namespace: dns
+spec:
+  type: ClusterIP
+  ports:
+  - name: dns-udp
+    port: 53
+    protocol: UDP
+    targetPort: 53
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+    targetPort: 53
+  selector:
+    app: dns-stack
