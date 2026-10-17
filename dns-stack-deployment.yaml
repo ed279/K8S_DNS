@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-stack
+  namespace: dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dns-stack
+  template:
+    metadata:
+      labels:
+        app: dns-stack
+    spec:
+      containers:
+      - name: dns
+        image: ubuntu:24.04
+        ports:
+        - containerPort: 53
+          protocol: UDP
+          hostPort: 53
+        - containerPort: 53
+          protocol: TCP
+          hostPort: 53
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          apt-get update >/dev/null 2>&1
+          apt-get install -y unbound dnsmasq dnsutils iproute2 >/dev/null 2>&1
+          echo "=== DNS Stack Starting ==="
+          pkill -f unbound || true
+          pkill -f dnsmasq || true
+          sleep 1
+          mkdir -p /var/log/unbound /var/lib/dnsmasq /etc/dnsmasq.d
+          printf '%s\n' 'server:' '  interface: 0.0.0.0' '  port: 5335' '  access-control: 0.0.0.0/0 allow' '  verbosity: 1' '  auto-trust-anchor-file: "/var/lib/unbound/root.key"' '  num-threads: 4' > /etc/unbound/unbound.conf
+          unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+          printf '%s\n' 'listen-address=0.0.0.0' 'port=53' 'bind-interfaces' 'user=root' 'server=127.0.0.1#5335' 'domain-needed' 'bogus-priv' 'cache-size=10000' > /etc/dnsmasq.conf
+          /usr/sbin/unbound & sleep 2
+          dnsmasq & sleep 2
+          echo "=== Ready ==="
+          while true; do sleep 5; done
+        readinessProbe:
+          exec:
+            command: [sh, -c, "ss -tlnp | grep -q ':53 ' && exit 0 || exit 1"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 2
+        livenessProbe:
+          exec:
+            command: [sh, -c, "ss -tlnp | grep -q ':53 ' && exit 0 || exit 1"]
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          failureThreshold: 3
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: 500m, memory: 512Mi}
